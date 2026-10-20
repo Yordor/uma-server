@@ -163,8 +163,8 @@ function statusOf(client) {
   return "idle";
 }
 
-function broadcastRoom(room) {
-  const state = {
+function buildState(room) {
+  return {
     t: "room_state",
     code: room.code,
     name: room.name,
@@ -182,6 +182,10 @@ function broadcastRoom(room) {
       spectators: tb.spectators.size,
     })),
   };
+}
+
+function broadcastRoom(room) {
+  const state = buildState(room);
   for (const id of room.members) send(clients.get(id), state);
 }
 
@@ -286,6 +290,7 @@ function tryMatch(room) {
       firstSeat: -1,
       seed: crypto.randomInt(1, 2147483647),
       log: [],
+      seqCounter: 0,
     };
     room.tables.set(tb.id, tb);
     a.tableId = tb.id;
@@ -463,8 +468,9 @@ function handle(client, m) {
     case "action": {
       const tb = tableOf(client);
       if (!tb || client.seat < 0 || tb.phase !== "playing") return;
-      const entry = { seq: tb.log.length, seat: client.seat, data: m.data };
+      const entry = { seq: tb.seqCounter++, seat: client.seat, data: m.data };
       tb.log.push(entry);
+      if (tb.log.length > 300) tb.log.shift();
       tableBroadcast(tb, { t: "action", seq: entry.seq, seat: entry.seat, data: entry.data }, client.id);
       break;
     }
@@ -474,6 +480,10 @@ function handle(client, m) {
       tb.phase = "done";
       tableBroadcast(tb, { t: "game_over", winner: m.winner, reason: "normal" }, client.id);
       closeTable(room, tb);
+      break;
+    }
+    case "get_state": {
+      if (room) send(client, buildState(room));
       break;
     }
     case "leave_table": {
