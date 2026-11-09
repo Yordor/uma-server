@@ -267,6 +267,8 @@ function closeTable(room, tb) {
     c.seat = -1;
     send(c, { t: "table_left" });
   }
+  if (tb.voteTimer) clearTimeout(tb.voteTimer);
+  tb.voteTimer = null;
   room.tables.delete(tb.id);
   tryMatch(room);
   broadcastRoom(room);
@@ -287,6 +289,8 @@ function tryMatch(room) {
       decks: [null, null],
       rps: [null, null],
       rpsWinner: -1,
+      votes: [null, null],
+      voteTimer: null,
       firstSeat: -1,
       seed: crypto.randomInt(1, 2147483647),
       log: [],
@@ -304,6 +308,76 @@ function tryMatch(room) {
     const c = clients.get(room.queue[i]);
     send(c, { t: "queue_status", position: i + 1, tablesFull: room.tables.size >= room.maxTables });
   }
+}
+
+const VOTE_SECONDS = 15;
+
+function methodIndex(m) {
+  return m === "coin" ? 0 : m === "rps" ? 1 : m === "dice" ? 2 : -1;
+}
+
+function startVote(room, tb) {
+  tb.phase = "vote";
+  tb.votes = [null, null];
+  tableBroadcast(tb, { t: "vote_start", seconds: VOTE_SECONDS }, 0);
+  tb.voteTimer = setTimeout(() => resolveVote(room, tb), VOTE_SECONDS * 1000 + 300);
+}
+
+function resolveVote(room, tb) {
+  if (tb.phase !== "vote") return;
+  if (tb.voteTimer) clearTimeout(tb.voteTimer);
+  tb.voteTimer = null;
+  const v = tb.votes;
+  let method;
+  let tie = false;
+  const all = ["coin", "dice", "rps"];
+  if (v[0] && v[1]) {
+    if (v[0] === v[1]) method = v[0];
+    else {
+      tie = true;
+      method = crypto.randomInt(0, 2) === 0 ? v[0] : v[1];
+    }
+  } else if (v[0] || v[1]) {
+    method = v[0] || v[1];
+  } else {
+    tie = true;
+    method = all[crypto.randomInt(0, 3)];
+  }
+  tb.phase = "method";
+  tableBroadcast(tb, { t: "vote_result", method, tie, votes: [methodIndex(v[0]), methodIndex(v[1])] }, 0);
+  tb.voteTimer = setTimeout(() => {
+    tb.voteTimer = null;
+    if (!room.tables.has(tb.id) || tb.phase !== "method") return;
+    if (method === "coin") {
+      const headsSeat = crypto.randomInt(0, 2);
+      const heads = crypto.randomInt(0, 2) === 0;
+      const winner = heads ? headsSeat : 1 - headsSeat;
+      tb.rpsWinner = winner;
+      tb.phase = "order";
+      tableBroadcast(tb, { t: "coin_result", headsSeat, coin: heads ? "heads" : "tails", winner }, 0);
+    } else if (method === "dice") {
+      const dice = [];
+      for (let i = 0; i < 12; i++) {
+        const d0 = crypto.randomInt(1, 7);
+        const d1 = crypto.randomInt(1, 7);
+        dice.push(d0, d1);
+        if (d0 !== d1) break;
+      }
+      let last = dice.length - 2;
+      if (dice[last] === dice[last + 1]) {
+        dice[last + 1] = dice[last] === 6 ? 5 : dice[last] + 1;
+      }
+      const winner = dice[last] > dice[last + 1] ? 0 : 1;
+      tb.rpsWinner = winner;
+      tb.phase = "order";
+      tableBroadcast(tb, { t: "dice_result", dice, winner }, 0);
+    } else {
+      tb.phase = "rps";
+      tb.rps = [null, null];
+      tableBroadcast(tb, { t: "rps_start" }, 0);
+    }
+    broadcastRoom(room);
+  }, 2200);
 }
 
 function rpsResolve(a, b) {
@@ -427,11 +501,20 @@ function handle(client, m) {
       if (!tb || client.seat < 0 || tb.phase !== "ready") return;
       tb.decks[client.seat] = m.deck;
       if (tb.decks[0] && tb.decks[1]) {
-        tb.phase = "rps";
-        tb.rps = [null, null];
-        tableBroadcast(tb, { t: "rps_start" }, 0);
+        startVote(room, tb);
         broadcastRoom(room);
       }
+      break;
+    }
+    case "vote": {
+      const tb = tableOf(client);
+      if (!tb || client.seat < 0 || tb.phase !== "vote") return;
+      const mth = m.method === "coin" ? "coin" : m.method === "rps" ? "rps" : m.method === "dice" ? "dice" : null;
+      if (!mth) return;
+      if (tb.votes[client.seat]) return;
+      tb.votes[client.seat] = mth;
+      tableBroadcast(tb, { t: "vote_locked", seat: client.seat }, client.id);
+      if (tb.votes[0] && tb.votes[1]) resolveVote(room, tb);
       break;
     }
     case "rps": {
