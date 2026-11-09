@@ -230,6 +230,16 @@ function leaveTable(client, silent) {
     client.seat = -1;
     return;
   }
+  if (client.seat >= 0 && tb.phase === "waiting") {
+    tb.seats[client.seat] = null;
+    client.tableId = 0;
+    client.seat = -1;
+    if (!tb.seats[0] && !tb.seats[1] && tb.spectators.size === 0) room.tables.delete(tb.id);
+    if (!silent) send(client, { t: "table_left" });
+    tryMatch(room);
+    broadcastRoom(room);
+    return;
+  }
   if (client.seat >= 0) {
     if (tb.phase !== "done") {
       const other = tb.seats[1 - client.seat];
@@ -274,6 +284,32 @@ function closeTable(room, tb) {
   broadcastRoom(room);
 }
 
+function newTable(seats) {
+  return {
+    id: nextTableId++,
+    seats,
+    spectators: new Set(),
+    phase: "ready",
+    decks: [null, null],
+    rps: [null, null],
+    rpsWinner: -1,
+    votes: [null, null],
+    voteTimer: null,
+    firstSeat: -1,
+    seed: crypto.randomInt(1, 2147483647),
+    log: [],
+    seqCounter: 0,
+  };
+}
+
+function startMatch(tb) {
+  tb.phase = "ready";
+  const a = clients.get(tb.seats[0]);
+  const b = clients.get(tb.seats[1]);
+  send(a, { t: "match_found", tableId: tb.id, seat: 0, opponent: b.name, seed: tb.seed });
+  send(b, { t: "match_found", tableId: tb.id, seat: 1, opponent: a.name, seed: tb.seed });
+}
+
 function tryMatch(room) {
   while (room.queue.length >= 2 && room.tables.size < room.maxTables) {
     const a = clients.get(room.queue.shift());
@@ -281,28 +317,13 @@ function tryMatch(room) {
     if (!a || !b) continue;
     a.queued = false;
     b.queued = false;
-    const tb = {
-      id: nextTableId++,
-      seats: [a.id, b.id],
-      spectators: new Set(),
-      phase: "ready",
-      decks: [null, null],
-      rps: [null, null],
-      rpsWinner: -1,
-      votes: [null, null],
-      voteTimer: null,
-      firstSeat: -1,
-      seed: crypto.randomInt(1, 2147483647),
-      log: [],
-      seqCounter: 0,
-    };
+    const tb = newTable([a.id, b.id]);
     room.tables.set(tb.id, tb);
     a.tableId = tb.id;
     a.seat = 0;
     b.tableId = tb.id;
     b.seat = 1;
-    send(a, { t: "match_found", tableId: tb.id, seat: 0, opponent: b.name, seed: tb.seed });
-    send(b, { t: "match_found", tableId: tb.id, seat: 1, opponent: a.name, seed: tb.seed });
+    startMatch(tb);
   }
   for (let i = 0; i < room.queue.length; i++) {
     const c = clients.get(room.queue[i]);
@@ -470,11 +491,82 @@ function handle(client, m) {
       broadcastRoom(room);
       break;
     }
+    case "quick_room": {
+      if (room) return err(client, "อยู่ในห้องแล้ว");
+      const code = String(m.code || "DEV1").toUpperCase().slice(0, 8);
+      let r = rooms.get(code);
+      if (!r) {
+        r = {
+          code,
+          name: "DEV " + code,
+          hostId: client.id,
+          maxTables: 4,
+          members: new Set(),
+          tables: new Map(),
+          queue: [],
+        };
+        rooms.set(code, r);
+      }
+      r.members.add(client.id);
+      client.room = code;
+      send(client, { t: "joined_room", code });
+      broadcastRoom(r);
+      break;
+    }
+    case "quick_sit": {
+      if (!room) return err(client, "ยังไม่ได้เข้าห้อง");
+      if (client.tableId) return;
+      let waiting = null;
+      for (const tb of room.tables.values()) {
+        if (tb.phase === "waiting" && (!tb.seats[0] || !tb.seats[1])) {
+          waiting = tb;
+          break;
+        }
+      }
+      if (waiting) handle(client, { t: "sit", tableId: waiting.id });
+      else handle(client, { t: "create_table" });
+      break;
+    }
+    case "create_table": {
+      if (!room) return err(client, "ยังไม่ได้เข้าห้อง");
+      if (client.tableId) return err(client, "อยู่ที่โต๊ะอยู่แล้ว");
+      if (room.tables.size >= room.maxTables) return err(client, "โต๊ะเต็ม");
+      removeFromQueue(client);
+      const tb = newTable([client.id, null]);
+      tb.phase = "waiting";
+      room.tables.set(tb.id, tb);
+      client.tableId = tb.id;
+      client.seat = 0;
+      send(client, { t: "seated", tableId: tb.id, seat: 0 });
+      broadcastRoom(room);
+      break;
+    }
+    case "sit": {
+      if (!room) return err(client, "ยังไม่ได้เข้าห้อง");
+      if (client.tableId) return err(client, "อยู่ที่โต๊ะอยู่แล้ว");
+      const tb = room.tables.get(parseInt(m.tableId, 10));
+      if (!tb) return err(client, "ไม่พบโต๊ะ");
+      if (tb.phase !== "waiting") return err(client, "โต๊ะนี้เริ่มแข่งแล้ว");
+      const seat = tb.seats[0] ? (tb.seats[1] ? -1 : 1) : 0;
+      if (seat < 0) return err(client, "โต๊ะเต็มแล้ว");
+      removeFromQueue(client);
+      tb.seats[seat] = client.id;
+      client.tableId = tb.id;
+      client.seat = seat;
+      if (tb.seats[0] && tb.seats[1]) {
+        startMatch(tb);
+      } else {
+        send(client, { t: "seated", tableId: tb.id, seat });
+      }
+      broadcastRoom(room);
+      break;
+    }
     case "watch": {
       if (!room) return err(client, "ยังไม่ได้เข้าห้อง");
       if (client.tableId) return err(client, "อยู่ที่โต๊ะอยู่แล้ว");
       const tb = room.tables.get(parseInt(m.tableId, 10));
       if (!tb) return err(client, "ไม่พบโต๊ะ");
+      if (tb.phase === "waiting") return err(client, "โต๊ะนี้ยังรอคู่แข่งอยู่ กดนั่งได้เลย");
       removeFromQueue(client);
       tb.spectators.add(client.id);
       client.tableId = tb.id;
