@@ -1,5 +1,12 @@
 const http = require("http");
 const crypto = require("crypto");
+const { createStore } = require("./store");
+const { createAccounts } = require("./accounts");
+
+const ALLOW_GUEST = process.env.ALLOW_GUEST === "1";
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const store = createStore();
+const accounts = createAccounts(store);
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const MAX_TABLES_LIMIT = 16;
@@ -421,12 +428,92 @@ function startGame(tb) {
   );
 }
 
+const OPEN_TYPES = new Set(["hello", "ping", "register", "login", "resume", "logout"]);
+
+function isAuthed(client) {
+  return !!client.account || (ALLOW_GUEST && client.guest);
+}
+
+function attachAccount(client, user, token) {
+  for (const c of clients.values()) {
+    if (c !== client && c.account && c.account.key === user.key) {
+      send(c, { t: "kicked", msg: "มีการเข้าสู่ระบบบัญชีนี้จากที่อื่น" });
+      try {
+        c.conn.close();
+      } catch (e) {}
+    }
+  }
+  if (client.room) leaveRoom(client);
+  client.account = { key: user.key, name: user.name, collection: user.collection };
+  client.token = token;
+  client.guest = false;
+  client.name = user.name;
+  send(client, accounts.payload(user, token));
+  send(client, { t: "welcome", id: client.id, name: client.name });
+}
+
+async function handleAuth(client, m) {
+  const ip = client.ip || "";
+  if (m.t === "register" || m.t === "login") {
+    const r = m.t === "register" ? await accounts.register(ip, m.user, m.pass) : await accounts.login(ip, m.user, m.pass);
+    if (r.error) return send(client, { t: "auth_fail", msg: r.error });
+    attachAccount(client, r.user, r.token);
+    return;
+  }
+  if (m.t === "resume") {
+    const r = await accounts.resume(m.token);
+    if (r.error) return send(client, { t: "auth_fail", msg: r.error, resume: true });
+    attachAccount(client, r.user, r.token);
+    return;
+  }
+  if (m.t === "logout") {
+    await accounts.logout(m.token || client.token);
+    if (client.room) leaveRoom(client);
+    client.account = null;
+    client.token = "";
+    client.guest = false;
+    client.name = "Player";
+    send(client, { t: "logged_out" });
+  }
+}
+
 function handle(client, m) {
   const room = client.room ? rooms.get(client.room) : null;
+  if (!OPEN_TYPES.has(m.t) && !isAuthed(client)) {
+    return send(client, { t: "auth_required", msg: "ต้องเข้าสู่ระบบก่อน" });
+  }
   switch (m.t) {
     case "hello": {
-      client.name = String(m.name || "Player").slice(0, 20) || "Player";
+      if (ALLOW_GUEST && !client.account) {
+        client.guest = true;
+        client.name = String(m.name || "Player").slice(0, 20) || "Player";
+      }
       send(client, { t: "welcome", id: client.id, name: client.name });
+      break;
+    }
+    case "register":
+    case "login":
+    case "resume":
+    case "logout": {
+      handleAuth(client, m).catch((e) => {
+        console.error("auth error", e);
+        send(client, { t: "auth_fail", msg: "เซิร์ฟเวอร์ผิดพลาด ลองใหม่อีกครั้ง" });
+      });
+      break;
+    }
+    case "save_decks": {
+      if (!client.account) return err(client, "บัญชีผู้เล่นรับเด็คได้เฉพาะเมื่อเข้าสู่ระบบ");
+      const list = m.data && m.data.decks;
+      accounts
+        .saveDecks(client.account.key, list)
+        .then((r) => {
+          if (r.error) send(client, { t: "decks_error", msg: r.error });
+          else send(client, { t: "decks_saved", n: r.decks.length });
+        })
+        .catch((e) => {
+          console.error("save_decks error", e);
+          send(client, { t: "decks_error", msg: "บันทึกเด็คไม่สำเร็จ" });
+        });
       break;
     }
     case "list_rooms": {
@@ -591,6 +678,11 @@ function handle(client, m) {
     case "ready": {
       const tb = tableOf(client);
       if (!tb || client.seat < 0 || tb.phase !== "ready") return;
+      if (client.account && !accounts.deckWithinCollection(m.deck, client.account.collection)) {
+        err(client, "เด็คนี้มีการ์ดที่ไม่มีในคอลเลกชันของคุณ");
+        leaveTable(client, false);
+        return;
+      }
       tb.decks[client.seat] = m.deck;
       if (tb.decks[0] && tb.decks[1]) {
         startVote(room, tb);
@@ -674,10 +766,82 @@ function handle(client, m) {
   }
 }
 
+function readBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const parts = [];
+    req.on("data", (d) => {
+      size += d.length;
+      if (size > limit) {
+        reject(new Error("too large"));
+        req.destroy();
+        return;
+      }
+      parts.push(d);
+    });
+    req.on("end", () => resolve(Buffer.concat(parts).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function jsonRes(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(obj));
+}
+
+async function adminGrant(req, res) {
+  if (!ADMIN_KEY) return jsonRes(res, 404, { error: "admin ปิดอยู่ (ไม่ได้ตั้ง ADMIN_KEY)" });
+  const given = Buffer.from(String(req.headers["x-admin-key"] || ""));
+  const want = Buffer.from(ADMIN_KEY);
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return jsonRes(res, 403, { error: "คีย์ไม่ถูกต้อง" });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 200000));
+  } catch (e) {
+    return jsonRes(res, 400, { error: "JSON ไม่ถูกต้อง" });
+  }
+  const key = String(body.user || "").toLowerCase();
+  const user = await store.getUser(key);
+  if (!user) return jsonRes(res, 404, { error: "ไม่พบบัญชี" });
+  let coll = user.collection;
+  if (body.all === true) {
+    coll = null;
+  } else if (body.cards && typeof body.cards === "object") {
+    if (!coll && body.mode !== "set") return jsonRes(res, 400, { error: "บัญชีนี้ปลดล็อกทุกใบอยู่แล้ว ใช้ mode set พร้อม cards ทั้งชุดเพื่อจำกัด", allUnlocked: true });
+    coll = body.mode === "set" && !coll ? {} : Object.assign({}, coll);
+    for (const k of Object.keys(body.cards)) {
+      const id = String(parseInt(k, 10));
+      const n = parseInt(body.cards[k], 10);
+      if (!(parseInt(k, 10) >= 0) || isNaN(n)) continue;
+      const cur = coll[id] || 0;
+      const next = body.mode === "set" ? n : cur + n;
+      if (next > 0) coll[id] = Math.min(next, 99);
+      else delete coll[id];
+    }
+  } else {
+    return jsonRes(res, 400, { error: "ต้องส่ง all:true หรือ cards:{id:จำนวน}" });
+  }
+  await accounts.setCollection(key, coll);
+  for (const c of clients.values()) {
+    if (c.account && c.account.key === key) {
+      c.account.collection = coll;
+      send(c, accounts.payload(Object.assign({}, user, { collection: coll }), c.token));
+    }
+  }
+  jsonRes(res, 200, { ok: true, allUnlocked: !coll, kinds: coll ? Object.keys(coll).length : -1 });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, clients: clients.size, rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, clients: clients.size, rooms: rooms.size, store: store.kind }));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/admin/grant") {
+    adminGrant(req, res).catch((e) => {
+      console.error("admin error", e);
+      jsonRes(res, 500, { error: "server error" });
+    });
     return;
   }
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -698,7 +862,20 @@ server.on("upgrade", (req, socket) => {
   );
   socket.setNoDelay(true);
 
-  const client = { id: nextClientId++, name: "Player", room: null, tableId: 0, seat: -1, queued: false, conn: null };
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  const client = {
+    id: nextClientId++,
+    name: "Player",
+    room: null,
+    tableId: 0,
+    seat: -1,
+    queued: false,
+    conn: null,
+    account: null,
+    token: "",
+    guest: false,
+    ip: fwd || socket.remoteAddress || "",
+  };
   client.conn = new Conn(
     socket,
     (text) => {
@@ -728,6 +905,14 @@ server.on("upgrade", (req, socket) => {
   send(client, { t: "welcome", id: client.id, name: client.name });
 });
 
-server.listen(PORT, () => console.log("UmaCardGame server listening on :" + PORT));
+store
+  .init()
+  .then(() => {
+    server.listen(PORT, () => console.log("UmaCardGame server listening on :" + PORT + " store=" + store.kind + " guest=" + ALLOW_GUEST));
+  })
+  .catch((e) => {
+    console.error("เริ่ม store ไม่สำเร็จ", e);
+    process.exit(1);
+  });
 
 module.exports = server;
